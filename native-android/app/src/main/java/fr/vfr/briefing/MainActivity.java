@@ -123,7 +123,7 @@ public class MainActivity extends BridgeActivity implements SensorEventListener,
     }
 
     @Override
-    protected void onResume() {
+    public void onResume() {
         super.onResume();
         if (sensorManager != null) {
             Sensor pressure = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE);
@@ -139,7 +139,7 @@ public class MainActivity extends BridgeActivity implements SensorEventListener,
     }
 
     @Override
-    protected void onPause() {
+    public void onPause() {
         super.onPause();
         if (sensorManager != null) {
             sensorManager.unregisterListener(this);
