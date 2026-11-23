@@ -280,7 +280,7 @@ public class MainActivity extends BridgeActivity implements SensorEventListener,
         public String getOaciDimensionsJson() {
             int[] dims = oaciTileEngine.getDimensions();
             if (dims == null) return "";
-            return "{"width":" + dims[0] + ","height":" + dims[1] + "}";
+            return "{\"width\":" + dims[0] + ",\"height\":" + dims[1] + "}";
         }
 
         @JavascriptInterface
