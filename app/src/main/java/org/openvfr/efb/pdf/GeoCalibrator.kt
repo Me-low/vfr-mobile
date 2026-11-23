@@ -1,167 +1,140 @@
-package org.openvfr.efb.pdf
+package com.tonpackage.vfrmobile.geo
 
-import org.maplibre.android.geometry.LatLng
-import org.maplibre.android.geometry.LatLngQuad
 import kotlin.math.*
 
-data class ControlPoint(
-    val pdfX: Double, // Coordonnée normalisée [0.0 .. 1.0] sur la page PDF
-    val pdfY: Double,
-    val lat: Double,
-    val lon: Double
+data class CalibPoint(
+    val x: Double,      // Coordonnée X en pixels/points PDF
+    val y: Double,      // Coordonnée Y en pixels/points PDF
+    val lat: Double,    // Latitude WGS84 (degrés décimaux)
+    val lon: Double,    // Longitude WGS84 (degrés décimaux)
+    val errMeters: Double = 0.0
 )
 
-data class CalibrationResult(
-    val quad: LatLngQuad,
-    val rmseMeters: Double,
-    val modelName: String
-)
+data class MapModel(
+    val aRe: Double,
+    val aIm: Double,
+    val bRe: Double,
+    val bIm: Double,
+    val points: List<CalibPoint>,
+    val rmsMeters: Double,
+    val maxMeters: Double,
+    val ptPerKm: Double,
+    val rotationDeg: Double
+) {
+    companion object {
+        const val WGS_A = 6378137.0
+        const val WGS_E = 0.0818191908426
+        const val LCC_PHI_REF = 46.5
+        const val LCC_N = 0.7256
 
-/**
- * Solveur géodésique multi-modèles pour la calibration de cartes PDF (VAC / OACI) :
- * - 2 points : Similitude (translation, rotation, échelle uniforme)
- * - 3 points : Transformation affine complète par moindres carrés
- * - >= 4 points : Régression polynomiale bilinéaire pour absorber la projection Lambert
- */
-object GeoCalibrator {
-
-    fun calibrate(points: List<ControlPoint>): CalibrationResult? {
-        if (points.size < 2) return null
-
-        val refLat = points.map { it.lat }.average()
-        val cosLat = cos(Math.toRadians(refLat)).coerceAtLeast(0.1)
-
-        fun toLocalX(lon: Double) = lon * cosLat
-        fun toLocalY(lat: Double) = lat
-        fun toLon(lx: Double) = lx / cosLat
-        fun toLat(ly: Double) = ly
-
-        val modelName: String
-        val transform: (Double, Double) -> LatLng = when {
-            points.size == 2 -> {
-                modelName = "Similitude (2 pts)"
-                val p1 = points[0]; val p2 = points[1]
-                val dx = p2.pdfX - p1.pdfX
-                val dy = p2.pdfY - p1.pdfY
-                val dX = toLocalX(p2.lon) - toLocalX(p1.lon)
-                val dY = toLocalY(p2.lat) - toLocalY(p1.lat)
-
-                val denom = dx * dx + dy * dy
-                if (denom < 1e-12) return null
-
-                val a = (dx * dX + dy * dY) / denom
-                val b = (dx * dY - dy * dX) / denom
-                val tx = toLocalX(p1.lon) - (a * p1.pdfX - b * p1.pdfY)
-                val ty = toLocalY(p1.lat) - (b * p1.pdfX + a * p1.pdfY)
-
-                { u, v ->
-                    val lx = a * u - b * v + tx
-                    val ly = b * u + a * v + ty
-                    LatLng(toLat(ly), toLon(lx))
-                }
-            }
-            points.size == 3 -> {
-                modelName = "Affine (3 pts)"
-                val coeffsLon = solveLinearLeastSquares(
-                    points.map { doubleArrayOf(it.pdfX, it.pdfY, 1.0) },
-                    points.map { toLocalX(it.lon) },
-                    3
-                ) ?: return null
-
-                val coeffsLat = solveLinearLeastSquares(
-                    points.map { doubleArrayOf(it.pdfX, it.pdfY, 1.0) },
-                    points.map { toLocalY(it.lat) },
-                    3
-                ) ?: return null
-
-                { u, v ->
-                    val lx = coeffsLon[0] * u + coeffsLon[1] * v + coeffsLon[2]
-                    val ly = coeffsLat[0] * u + coeffsLat[1] * v + coeffsLat[2]
-                    LatLng(toLat(ly), toLon(lx))
-                }
-            }
-            else -> {
-                modelName = "Bilinéaire Lambert (${points.size} pts)"
-                val coeffsLon = solveLinearLeastSquares(
-                    points.map { doubleArrayOf(it.pdfX, it.pdfY, it.pdfX * it.pdfY, 1.0) },
-                    points.map { toLocalX(it.lon) },
-                    4
-                ) ?: return null
-
-                val coeffsLat = solveLinearLeastSquares(
-                    points.map { doubleArrayOf(it.pdfX, it.pdfY, it.pdfX * it.pdfY, 1.0) },
-                    points.map { toLocalY(it.lat) },
-                    4
-                ) ?: return null
-
-                { u, v ->
-                    val lx = coeffsLon[0] * u + coeffsLon[1] * v + coeffsLon[2] * (u * v) + coeffsLon[3]
-                    val ly = coeffsLat[0] * u + coeffsLat[1] * v + coeffsLat[2] * (u * v) + coeffsLat[3]
-                    LatLng(toLat(ly), toLon(lx))
-                }
-            }
+        private fun lccT(phiRad: Double): Double {
+            val s = sin(phiRad)
+            return tan(PI / 4.0 - phiRad / 2.0) /
+                ((1.0 - WGS_E * s) / (1.0 + WGS_E * s)).pow(WGS_E / 2.0)
         }
 
-        val sqErrors = points.map { pt ->
-            val predicted = transform(pt.pdfX, pt.pdfY)
-            val d = haversineMeters(pt.lat, pt.lon, predicted.latitude, predicted.longitude)
-            d * d
+        private fun lccRho0(): Double {
+            val p0 = Math.toRadians(LCC_PHI_REF)
+            val m0 = cos(p0) / sqrt(1.0 - (WGS_E * sin(p0)).pow(2))
+            return WGS_A * m0 / LCC_N
         }
-        val rmse = sqrt(sqErrors.average())
 
-        val quad = LatLngQuad(
-            transform(0.0, 0.0),
-            transform(1.0, 0.0),
-            transform(1.0, 1.0),
-            transform(0.0, 1.0)
-        )
-        return CalibrationResult(quad = quad, rmseMeters = rmse, modelName = modelName)
+        fun lccXY(lat: Double, lon: Double): Pair<Double, Double> {
+            val p0 = Math.toRadians(LCC_PHI_REF)
+            val rho0 = lccRho0()
+            val rho = rho0 * (lccT(Math.toRadians(lat)) / lccT(p0)).pow(LCC_N)
+            val th = LCC_N * Math.toRadians(lon)
+            return Pair(rho * sin(th), rho0 - rho * cos(th))
+        }
+
+        /** Résout w = a*z + b aux moindres carrés (exactement comme build_map_model dans maptiles.py) */
+        fun solve(rawPoints: List<CalibPoint>): MapModel {
+            require(rawPoints.size >= 2) { "Il faut au moins 2 points de calage." }
+
+            val zs = rawPoints.map { p ->
+                val (xLcc, yLcc) = lccXY(p.lat, p.lon)
+                Pair(xLcc, -yLcc) // z = X - i*Y
+            }
+            val ws = rawPoints.map { Pair(it.x, it.y) }
+
+            val zmRe = zs.map { it.first }.average()
+            val zmIm = zs.map { it.second }.average()
+            val wmRe = ws.map { it.first }.average()
+            val wmIm = ws.map { it.second }.average()
+
+            var den = 0.0
+            var numRe = 0.0
+            var numIm = 0.0
+
+            for (i in zs.indices) {
+                val dzRe = zs[i].first - zmRe
+                val dzIm = zs[i].second - zmIm
+                val dwRe = ws[i].first - wmRe
+                val dwIm = ws[i].second - wmIm
+
+                den += dzRe * dzRe + dzIm * dzIm
+                // conj(dz) * dw = (dzRe - i*dzIm) * (dwRe + i*dwIm)
+                numRe += dzRe * dwRe + dzIm * dwIm
+                numIm += dzRe * dwIm - dzIm * dwRe
+            }
+
+            require(den >= 1e6) { "Les points de calage sont trop proches ou confondus." }
+
+            val aRe = numRe / den
+            val aIm = numIm / den
+            val bRe = wmRe - (aRe * zmRe - aIm * zmIm)
+            val bIm = wmIm - (aRe * zmIm + aIm * zmRe)
+            val absA = hypot(aRe, aIm)
+
+            val scoredPoints = rawPoints.mapIndexed { i, p ->
+                val predX = (aRe * zs[i].first - aIm * zs[i].second) + bRe
+                val predY = (aRe * zs[i].second + aIm * zs[i].first) + bIm
+                val errM = hypot(ws[i].first - predX, ws[i].second - predY) / absA
+                p.copy(errMeters = (errM * 10.0).roundToInt() / 10.0)
+            }
+
+            val rms = sqrt(scoredPoints.map { it.errMeters * it.errMeters }.average())
+            val maxErr = scoredPoints.maxOf { it.errMeters }
+
+            return MapModel(
+                aRe = aRe,
+                aIm = aIm,
+                bRe = bRe,
+                bIm = bIm,
+                points = scoredPoints,
+                rmsMeters = (rms * 10.0).roundToInt() / 10.0,
+                maxMeters = (maxErr * 10.0).roundToInt() / 10.0,
+                ptPerKm = absA * 1000.0,
+                rotationDeg = Math.toDegrees(atan2(aIm, aRe))
+            )
+        }
     }
 
-    private fun solveLinearLeastSquares(rows: List<DoubleArray>, target: List<Double>, dim: Int): DoubleArray? {
-        val ata = Array(dim) { DoubleArray(dim) }
-        val atb = DoubleArray(dim)
-        for (i in rows.indices) {
-            val r = rows[i]
-            val y = target[i]
-            for (row in 0 until dim) {
-                atb[row] += r[row] * y
-                for (col in 0 until dim) {
-                    ata[row][col] += r[row] * r[col]
-                }
-            }
-        }
-        // Régularisation légère Tikhonov pour stabilité numérique
-        for (d in 0 until dim) ata[d][d] += 1e-10
-
-        for (i in 0 until dim) {
-            var maxRow = i
-            for (k in i + 1 until dim) if (abs(ata[k][i]) > abs(ata[maxRow][i])) maxRow = k
-            val tmp = ata[i]; ata[i] = ata[maxRow]; ata[maxRow] = tmp
-            val tmpB = atb[i]; atb[i] = atb[maxRow]; atb[maxRow] = tmpB
-
-            if (abs(ata[i][i]) < 1e-12) return null
-            for (k in i + 1 until dim) {
-                val factor = ata[k][i] / ata[i][i]
-                atb[k] -= factor * atb[i]
-                for (j in i until dim) ata[k][j] -= factor * ata[i][j]
-            }
-        }
-        val res = DoubleArray(dim)
-        for (i in dim - 1 downTo 0) {
-            var sum = atb[i]
-            for (j in i + 1 until dim) sum -= ata[i][j] * res[j]
-            res[i] = sum / ata[i][i]
-        }
-        return res
+    /** Géographique (WGS84) -> Pixels PDF */
+    fun geoToPdf(lat: Double, lon: Double): Pair<Double, Double> {
+        val (u, negV) = lccXY(lat, lon)
+        val x = aRe * u - aIm * negV + bRe
+        val y = aRe * negV + aIm * u + bIm
+        return Pair(x, y)
     }
 
-    private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val r = 6371000.0
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        val a = sin(dLat / 2).pow(2) +
-                cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2)
-        return 2 * r * asin(sqrt(a))
+    /** Pixels PDF -> Géographique (WGS84) */
+    fun pdfToGeo(x: Double, y: Double): Pair<Double, Double> {
+        val rho0 = lccRho0()
+        val d = aRe * aRe + aIm * aIm
+        val wr = x - bRe
+        val wi = y - bIm
+        val bigX = (wr * aRe + wi * aIm) / d
+        val bigY = -((wi * aRe - wr * aIm) / d)
+        val rho = hypot(bigX, rho0 - bigY)
+        val th = atan2(bigX, rho0 - bigY)
+        val t = lccT(Math.toRadians(LCC_PHI_REF)) * (rho / rho0).pow(1.0 / LCC_N)
+
+        var phi = PI / 2.0 - 2.0 * atan(t)
+        repeat(8) {
+            val s = sin(phi)
+            phi = PI / 2.0 - 2.0 * atan(t * ((1.0 - WGS_E * s) / (1.0 + WGS_E * s)).pow(WGS_E / 2.0))
+        }
+        return Pair(Math.toDegrees(phi), Math.toDegrees(th / LCC_N))
     }
 }
